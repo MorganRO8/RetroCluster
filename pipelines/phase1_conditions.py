@@ -244,28 +244,44 @@ def _write_output(records: list[ConditionRecord], output: Path) -> None:
     frame.to_parquet(output, index=False)
 
 
-def _load_input(path: str) -> list[dict[str, Any]]:
+SAMPLE_ROW_LIMIT = 1000
+
+
+def _load_input(path: str, *, sample: bool = False) -> tuple[list[dict[str, Any]], int]:
     pandas = _require_pandas()
     frame = pandas.read_parquet(path)
-    return frame.to_dict(orient="records")
+    total = len(frame)
+    if sample:
+        frame = frame.head(SAMPLE_ROW_LIMIT)
+    return frame.to_dict(orient="records"), total
 
 
 @click.command()
 @click.option("--input", "input_path", required=True, type=click.Path(exists=True, dir_okay=False))
 @click.option("--output", "output_path", required=True, type=click.Path(dir_okay=False))
+@click.option("--sample", is_flag=True, help="Process only the first 1,000 rows for smoke tests.")
 @click.option("--verbose/--quiet", default=False, show_default=True)
-def main(input_path: str, output_path: str, verbose: bool) -> None:
+def main(input_path: str, output_path: str, sample: bool, verbose: bool) -> None:
     """CLI entry point for phase 1 condition bucketing."""
 
     _configure_logging(verbose)
     LOGGER.info("Loading normalized reactions from %s", input_path)
-    rows = _load_input(input_path)
+    rows, total_rows = _load_input(input_path, sample=sample)
 
-    LOGGER.info("Processing %d records", len(rows))
+    if sample and total_rows > len(rows):
+        LOGGER.info("Sampling %d of %d rows", len(rows), total_rows)
+    else:
+        LOGGER.info("Processing %d records", len(rows))
+
     records = [_build_condition_record(row) for row in rows]
 
-    LOGGER.info("Writing %d condition keys to %s", len(records), output_path)
-    _write_output(records, Path(output_path))
+    output_path_obj = Path(output_path)
+    LOGGER.info("Writing %d condition keys to %s", len(records), output_path_obj)
+    _write_output(records, output_path_obj)
+
+    success_flag = output_path_obj.parent / "_SUCCESS"
+    success_flag.write_text("phase1 completed\n")
+    LOGGER.info("Wrote success sentinel to %s", success_flag)
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
