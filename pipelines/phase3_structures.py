@@ -5,7 +5,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence, Any
 
 import click
 
@@ -103,6 +103,51 @@ def _loads_list(value: object | None) -> list[str]:
             return [str(item) for item in parsed]
         return [str(parsed)]
     return [str(value)]
+
+
+def _parse_rxn_vids(value: object) -> list[int]:
+    rxn_vids: list[int] = []
+    for token in _loads_list(value):
+        text = token.strip()
+        if not text:
+            continue
+        try:
+            rxn_vids.append(int(text))
+        except ValueError as exc:  # pragma: no cover - defensive conversion guard
+            raise click.ClickException(
+                f"Unable to parse rxn_vid value '{token}' from clusters table"
+            ) from exc
+    return rxn_vids
+
+
+def _expand_clusters_by_rxn(clusters_frame: Any) -> Any:
+    """Ensure the clusters table has one row per reaction."""
+
+    if "rxn_vid" in clusters_frame.columns:
+        return clusters_frame
+    if "rxn_vids" not in clusters_frame.columns:
+        raise click.ClickException(
+            "clusters_level2 table must include either 'rxn_vid' or 'rxn_vids' column"
+        )
+
+    records: list[dict[str, object]] = []
+    for row in clusters_frame.to_dict(orient="records"):
+        rxn_vids = _parse_rxn_vids(row.get("rxn_vids"))
+        if not rxn_vids:
+            LOGGER.debug("Cluster %s has no member reactions; skipping", row.get("cluster_id"))
+            continue
+        base = {key: value for key, value in row.items() if key != "rxn_vids"}
+        for rxn_vid in rxn_vids:
+            member = base.copy()
+            member["rxn_vid"] = int(rxn_vid)
+            records.append(member)
+
+    pandas = _require_pandas()
+    if not records:
+        columns = [col for col in clusters_frame.columns if col != "rxn_vids"] + ["rxn_vid"]
+        return pandas.DataFrame(columns=columns)
+
+    return pandas.DataFrame(records)
 
 
 def _normalise_identifier(row: dict[str, object], *candidates: str, default: str) -> str:
@@ -255,6 +300,7 @@ def main(
     mechanisms = pandas.read_parquet(mechanism_path)
     LOGGER.info("Loading level 2 clusters from %s", clusters_path)
     clusters = pandas.read_parquet(clusters_path)
+    clusters = _expand_clusters_by_rxn(clusters)
 
     if sample:
         LOGGER.info("Sampling first 1000 rows for quick iteration")
