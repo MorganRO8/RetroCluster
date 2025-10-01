@@ -150,15 +150,47 @@ def _expand_clusters_by_rxn(clusters_frame: Any) -> Any:
     return pandas.DataFrame(records)
 
 
+_SUFFIX_CANDIDATES: tuple[str, ...] = ("", "_lvl2", "_sig")
+
+
+def _resolve_with_suffixes(row: dict[str, object], *names: str) -> object | None:
+    """Return the first non-empty value among candidate column names.
+
+    Phase 3 joins tables that frequently introduce suffixes (``_lvl2``/``_sig``).
+    The helper mirrors pandas' suffix behaviour so the downstream feature builder
+    can remain agnostic to the exact origin of the column.
+    """
+
+    seen: set[str] = set()
+    for name in names:
+        for variant in {name, name.lower()}:
+            if not variant:
+                continue
+            for suffix in _SUFFIX_CANDIDATES:
+                if suffix and variant.endswith(suffix):
+                    key = variant
+                elif suffix:
+                    key = f"{variant}{suffix}"
+                else:
+                    key = variant
+                if key in seen:
+                    continue
+                seen.add(key)
+                value = row.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                return value
+    return None
+
+
 def _normalise_identifier(row: dict[str, object], *candidates: str, default: str) -> str:
-    for candidate in candidates:
-        value = row.get(candidate)
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text:
-            return text
-    return default
+    value = _resolve_with_suffixes(row, *candidates)
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text or default
 
 
 def _hash_token_to_bit(token: str, fp_bits: int) -> int:
@@ -176,7 +208,8 @@ def _build_structure_feature(row: dict[str, object], fp_bits: int = 128) -> Stru
     mech_sig_base = row.get("mech_sig_base")
     if mech_sig_base:
         tokens.add(f"mech:{mech_sig_base}")
-    for token in _loads_list(row.get("event_tokens")):
+    event_source = _resolve_with_suffixes(row, "event_tokens")
+    for token in _loads_list(event_source):
         tokens.add(f"event:{token}")
 
     bits = {_hash_token_to_bit(token, fp_bits) for token in tokens}

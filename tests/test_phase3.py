@@ -61,3 +61,22 @@ def test_assign_structure_clusters_groups_similar_canopies():
     payload = next(cluster.to_dict() for cluster in clusters if cluster.sid == sid_first)
     assert json.loads(payload["rxn_vids"]) == [1, 2, 4]
     assert json.loads(payload["exemplar_vids"]) == [1, 2, 4]
+
+
+def test_structure_feature_reads_suffixed_columns():
+    base = {
+        "rxn_vid": 10,
+        "CID_lvl2": "cid-sfx",
+        "cluster_id_lvl2": "mid-sfx",
+        "scaffold_key_sig": "ScafX",
+    }
+    row_a = {**base, "event_tokens_sig": json.dumps(["tokA"]) }
+    row_b = {**base, "event_tokens_sig": json.dumps(["tokB"]) }
+
+    feature_a = _build_structure_feature(row_a, fp_bits=128)
+    feature_b = _build_structure_feature(row_b, fp_bits=128)
+
+    assert feature_a.cid == "cid-sfx"
+    assert feature_a.mid == "mid-sfx"
+    assert feature_a.scaffold_key == "ScafX"
+    assert feature_a.bits != feature_b.bits
