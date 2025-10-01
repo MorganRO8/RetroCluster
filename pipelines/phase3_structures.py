@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import json
 import logging
+import statistics
+from collections import Counter
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence, Any
 
 import click
 
@@ -105,15 +108,100 @@ def _loads_list(value: object | None) -> list[str]:
     return [str(value)]
 
 
-def _normalise_identifier(row: dict[str, object], *candidates: str, default: str) -> str:
-    for candidate in candidates:
-        value = row.get(candidate)
-        if value is None:
+def _parse_rxn_vids(value: object) -> list[int]:
+    rxn_vids: list[int] = []
+    for token in _loads_list(value):
+        text = token.strip()
+        if not text:
             continue
-        text = str(value).strip()
-        if text:
-            return text
-    return default
+        try:
+            rxn_vids.append(int(text))
+        except ValueError as exc:  # pragma: no cover - defensive conversion guard
+            raise click.ClickException(
+                f"Unable to parse rxn_vid value '{token}' from clusters table"
+            ) from exc
+    return rxn_vids
+
+
+def _expand_clusters_by_rxn(clusters_frame: Any) -> Any:
+    """Ensure the clusters table has one row per reaction."""
+
+    if "rxn_vid" in clusters_frame.columns:
+        return clusters_frame
+    if "rxn_vids" not in clusters_frame.columns:
+        raise click.ClickException(
+            "clusters_level2 table must include either 'rxn_vid' or 'rxn_vids' column"
+        )
+
+    records: list[dict[str, object]] = []
+    for row in clusters_frame.to_dict(orient="records"):
+        rxn_vids = _parse_rxn_vids(row.get("rxn_vids"))
+        if not rxn_vids:
+            LOGGER.debug("Cluster %s has no member reactions; skipping", row.get("cluster_id"))
+            continue
+        base = {key: value for key, value in row.items() if key != "rxn_vids"}
+        for rxn_vid in rxn_vids:
+            member = base.copy()
+            member["rxn_vid"] = int(rxn_vid)
+            records.append(member)
+
+    pandas = _require_pandas()
+    if not records:
+        columns = [col for col in clusters_frame.columns if col != "rxn_vids"] + ["rxn_vid"]
+        return pandas.DataFrame(columns=columns)
+
+    return pandas.DataFrame(records)
+
+
+_SUFFIX_CANDIDATES: tuple[str, ...] = ("", "_lvl2", "_sig")
+
+
+def _resolve_with_suffixes(
+    row: dict[str, object], *names: str, suffixes: Sequence[str] | None = None
+) -> object | None:
+    """Return the first non-empty value among candidate column names.
+
+    Phase 3 joins tables that frequently introduce suffixes (``_lvl2``/``_sig``).
+    The helper mirrors pandas' suffix behaviour so the downstream feature builder
+    can remain agnostic to the exact origin of the column.
+    """
+
+    suffix_order: Sequence[str]
+    if suffixes is None:
+        suffix_order = _SUFFIX_CANDIDATES
+    else:
+        suffix_order = tuple(suffixes)
+
+    seen: set[str] = set()
+    for name in names:
+        for variant in {name, name.lower()}:
+            if not variant:
+                continue
+            for suffix in suffix_order:
+                if suffix and variant.endswith(suffix):
+                    key = variant
+                elif suffix:
+                    key = f"{variant}{suffix}"
+                else:
+                    key = variant
+                if key in seen:
+                    continue
+                seen.add(key)
+                value = row.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                return value
+    return None
+
+
+def _normalise_identifier(row: dict[str, object], *candidates: str, default: str) -> str:
+    value = _resolve_with_suffixes(row, *candidates)
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text or default
 
 
 def _hash_token_to_bit(token: str, fp_bits: int) -> int:
@@ -121,22 +209,73 @@ def _hash_token_to_bit(token: str, fp_bits: int) -> int:
     return int(digest[:8], 16) % max(fp_bits, 1)
 
 
-def _build_structure_feature(row: dict[str, object], fp_bits: int = 128) -> StructureFeature:
+def _structure_components(
+    row: dict[str, object]
+) -> tuple[int, str, str, str, set[str], set[str], str | None]:
     rxn_vid = int(row["rxn_vid"])
     cid = _normalise_identifier(row, "CID", "cid", "cond_hash", default="unknown")
     mid = _normalise_identifier(row, "MID", "mid", "cluster_id", default="unknown")
     scaffold_key = _normalise_identifier(row, "scaffold_key", default="unknown")
 
     tokens: set[str] = {f"scaffold:{scaffold_key}"}
-    mech_sig_base = row.get("mech_sig_base")
+
+    mech_sig_val = row.get("mech_sig_base")
+    mech_sig_base: str | None
+    if mech_sig_val is None:
+        mech_sig_base = None
+    else:
+        mech_text = str(mech_sig_val).strip()
+        mech_sig_base = mech_text or None
     if mech_sig_base:
         tokens.add(f"mech:{mech_sig_base}")
-    for token in _loads_list(row.get("event_tokens")):
+
+    event_source = _resolve_with_suffixes(
+        row,
+        "event_tokens",
+        suffixes=("", "_sig", "_lvl2"),
+    )
+    raw_event_tokens = {
+        str(token).strip()
+        for token in _loads_list(event_source)
+        if str(token).strip()
+    }
+    for token in raw_event_tokens:
         tokens.add(f"event:{token}")
 
-    bits = {_hash_token_to_bit(token, fp_bits) for token in tokens}
+    return rxn_vid, cid, mid, scaffold_key, tokens, raw_event_tokens, mech_sig_base
 
-    return StructureFeature(rxn_vid=rxn_vid, cid=cid, mid=mid, scaffold_key=scaffold_key, bits=bits)
+
+def _feature_from_components(
+    rxn_vid: int,
+    cid: str,
+    mid: str,
+    scaffold_key: str,
+    tokens: Iterable[str],
+    fp_bits: int,
+) -> tuple[StructureFeature, set[int]]:
+    bitset = {_hash_token_to_bit(token, fp_bits) for token in tokens}
+    feature = StructureFeature(
+        rxn_vid=rxn_vid,
+        cid=cid,
+        mid=mid,
+        scaffold_key=scaffold_key,
+        bits=bitset,
+    )
+    return feature, bitset
+
+
+def _build_structure_feature(row: dict[str, object], fp_bits: int = 128) -> StructureFeature:
+    rxn_vid, cid, mid, scaffold_key, tokens, _raw_events, _mech = _structure_components(row)
+    feature, _ = _feature_from_components(rxn_vid, cid, mid, scaffold_key, tokens, fp_bits)
+    return feature
+
+
+def _log_counter(name: str, counter: Counter[Any], limit: int = 5) -> None:
+    if not counter:
+        LOGGER.info("%s: no observations", name)
+        return
+    top = counter.most_common(limit)
+    LOGGER.info("%s (top %s): %s", name, min(limit, len(counter)), top)
 
 
 def _tanimoto(a: Sequence[int] | set[int], b: Sequence[int] | set[int]) -> float:
@@ -202,6 +341,129 @@ def _assign_structure_clusters(
     return clusters
 
 
+def _summarize_structure_space(
+    features: list[StructureFeature],
+    bitsets: list[set[int]],
+    token_counts: list[int],
+    event_counts: list[int],
+    event_counter: Counter[str],
+    scaffold_counter: Counter[str],
+    mech_counter: Counter[str],
+    group_counter: Counter[tuple[str, str]],
+    missing_event_tokens: int,
+    canopy_threshold: float,
+) -> None:
+    if not features:
+        LOGGER.warning("No structure features produced; skipping statistics")
+        return
+
+    LOGGER.info("Structure features generated: %d", len(features))
+
+    bit_lengths = [len(bits) for bits in bitsets]
+    if bit_lengths:
+        LOGGER.info(
+            "Fingerprint bit counts: mean=%.2f median=%.2f min=%d max=%d",
+            statistics.fmean(bit_lengths),
+            statistics.median(bit_lengths),
+            min(bit_lengths),
+            max(bit_lengths),
+        )
+
+    unique_bitsets = len({frozenset(bits) for bits in bitsets})
+    LOGGER.info(
+        "Unique fingerprint bit patterns: %d/%d",
+        unique_bitsets,
+        len(bitsets),
+    )
+    if unique_bitsets <= 1 and len(bitsets) > 1:
+        LOGGER.warning(
+            "Fingerprint diversity collapsed (threshold %.2f); all reactions share the same bit pattern",
+            canopy_threshold,
+        )
+
+    empty_bitsets = sum(1 for bits in bitsets if not bits)
+    if empty_bitsets:
+        LOGGER.warning("%d reactions produced empty fingerprint bitsets", empty_bitsets)
+
+    if token_counts:
+        LOGGER.info(
+            "Token counts per reaction: mean=%.2f median=%.2f min=%d max=%d",
+            statistics.fmean(token_counts),
+            statistics.median(token_counts),
+            min(token_counts),
+            max(token_counts),
+        )
+
+    if event_counts:
+        LOGGER.info(
+            "Event tokens per reaction: mean=%.2f median=%.2f min=%d max=%d",
+            statistics.fmean(event_counts),
+            statistics.median(event_counts),
+            min(event_counts),
+            max(event_counts),
+        )
+
+    if event_counter:
+        _log_counter("Most common event tokens (structure phase)", event_counter)
+    else:
+        LOGGER.warning("No event tokens survived into structural features")
+
+    if missing_event_tokens:
+        LOGGER.warning(
+            "%d of %d reactions lacked event tokens after the join (%.2f%%)",
+            missing_event_tokens,
+            len(features),
+            100.0 * missing_event_tokens / len(features),
+        )
+
+    if scaffold_counter:
+        _log_counter("Most common scaffolds", scaffold_counter)
+    missing_scaffolds = len(features) - sum(scaffold_counter.values())
+    if missing_scaffolds:
+        LOGGER.warning(
+            "%d reactions missing scaffold assignments or marked as unknown",
+            missing_scaffolds,
+        )
+
+    if mech_counter:
+        _log_counter("Most common mechanism bases in structure phase", mech_counter)
+    missing_mech = len(features) - sum(mech_counter.values())
+    if missing_mech:
+        LOGGER.warning(
+            "%d reactions missing mechanism bases after join",
+            missing_mech,
+        )
+
+    if group_counter:
+        LOGGER.info("Unique (CID, MID) groups: %d", len(group_counter))
+        _log_counter("Largest (CID, MID) groups", group_counter)
+
+    sample_size = min(len(bitsets), 200)
+    if sample_size > 1:
+        sample_indices = list(range(sample_size))
+        scores = [
+            _tanimoto(bitsets[i], bitsets[j])
+            for i, j in combinations(sample_indices, 2)
+        ]
+        if scores:
+            LOGGER.info(
+                "Sampled tanimoto scores (%d pairs): mean=%.3f median=%.3f min=%.3f max=%.3f",
+                len(scores),
+                statistics.fmean(scores),
+                statistics.median(scores),
+                min(scores),
+                max(scores),
+            )
+            if min(scores) == max(scores):
+                LOGGER.warning(
+                    "Sampled tanimoto scores are constant at %.3f despite threshold %.2f",
+                    scores[0],
+                    canopy_threshold,
+                )
+    elif len(bitsets) <= 1:
+        LOGGER.warning("Not enough reactions to sample tanimoto diversity")
+
+
 def _write_parquet(records: list[dict[str, object]], path: Path) -> None:
     pandas = _require_pandas()
     frame = pandas.DataFrame(records)
@@ -255,6 +517,7 @@ def main(
     mechanisms = pandas.read_parquet(mechanism_path)
     LOGGER.info("Loading level 2 clusters from %s", clusters_path)
     clusters = pandas.read_parquet(clusters_path)
+    clusters = _expand_clusters_by_rxn(clusters)
 
     if sample:
         LOGGER.info("Sampling first 1000 rows for quick iteration")
@@ -264,11 +527,50 @@ def main(
     LOGGER.info("Joining tables on rxn_vid")
     merged = clusters.merge(mechanisms, on="rxn_vid", how="inner", suffixes=("_lvl2", "_sig"))
     LOGGER.info("Computing structure features for %d reactions", len(merged))
+    if merged.empty:
+        LOGGER.warning("Joined table is empty; downstream outputs will be empty as well")
 
-    features = [
-        _build_structure_feature(row, fp_bits=fp_bits)
-        for row in merged.to_dict(orient="records")
-    ]
+    records = merged.to_dict(orient="records")
+
+    features: list[StructureFeature] = []
+    bitsets: list[set[int]] = []
+    token_counts: list[int] = []
+    event_counts: list[int] = []
+    event_counter: Counter[str] = Counter()
+    scaffold_counter: Counter[str] = Counter()
+    mech_counter: Counter[str] = Counter()
+    group_counter: Counter[tuple[str, str]] = Counter()
+    missing_event_tokens = 0
+
+    for row in records:
+        rxn_vid, cid, mid, scaffold_key, tokens, raw_events, mech_sig_base = _structure_components(row)
+        feature, bitset = _feature_from_components(rxn_vid, cid, mid, scaffold_key, tokens, fp_bits)
+        features.append(feature)
+        bitsets.append(bitset)
+        token_counts.append(len(tokens))
+        event_counts.append(len(raw_events))
+        if raw_events:
+            event_counter.update(raw_events)
+        else:
+            missing_event_tokens += 1
+        if scaffold_key and scaffold_key != "unknown":
+            scaffold_counter[scaffold_key] += 1
+        if mech_sig_base:
+            mech_counter[mech_sig_base] += 1
+        group_counter[(cid, mid)] += 1
+
+    _summarize_structure_space(
+        features,
+        bitsets,
+        token_counts,
+        event_counts,
+        event_counter,
+        scaffold_counter,
+        mech_counter,
+        group_counter,
+        missing_event_tokens,
+        canopy_threshold,
+    )
 
     LOGGER.info("Assigning structural clusters using Tanimoto canopy threshold %.2f", canopy_threshold)
     clusters_lvl3 = _assign_structure_clusters(features, tanimoto_threshold=canopy_threshold)

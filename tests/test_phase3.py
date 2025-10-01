@@ -4,6 +4,7 @@ from pipelines.phase3_structures import (
     StructureFeature,
     _assign_structure_clusters,
     _build_structure_feature,
+    _hash_token_to_bit,
     _tanimoto,
 )
 
@@ -61,3 +62,45 @@ def test_assign_structure_clusters_groups_similar_canopies():
     payload = next(cluster.to_dict() for cluster in clusters if cluster.sid == sid_first)
     assert json.loads(payload["rxn_vids"]) == [1, 2, 4]
     assert json.loads(payload["exemplar_vids"]) == [1, 2, 4]
+
+
+def test_structure_feature_reads_suffixed_columns():
+    base = {
+        "rxn_vid": 10,
+        "CID_lvl2": "cid-sfx",
+        "cluster_id_lvl2": "mid-sfx",
+        "scaffold_key_sig": "ScafX",
+    }
+    row_a = {**base, "event_tokens_sig": json.dumps(["tokA"]) }
+    row_b = {**base, "event_tokens_sig": json.dumps(["tokB"]) }
+
+    feature_a = _build_structure_feature(row_a, fp_bits=128)
+    feature_b = _build_structure_feature(row_b, fp_bits=128)
+
+    assert feature_a.cid == "cid-sfx"
+    assert feature_a.mid == "mid-sfx"
+    assert feature_a.scaffold_key == "ScafX"
+    assert feature_a.bits != feature_b.bits
+
+
+def test_structure_feature_prefers_mechanism_event_tokens_over_level2():
+    row = {
+        "rxn_vid": 5,
+        "CID_lvl2": "cid-ev",
+        "cluster_id_lvl2": "mid-ev",
+        "scaffold_key_sig": "ScafY",
+        "mech_sig_base": "base-ev",
+        "event_tokens_lvl2": json.dumps(["lvl2-token"]),
+        "event_tokens_sig": json.dumps(["sig-token"]),
+    }
+
+    feature = _build_structure_feature(row, fp_bits=512)
+
+    expected_tokens = {
+        "scaffold:ScafY",
+        "mech:base-ev",
+        "event:sig-token",
+    }
+
+    expected_bits = {_hash_token_to_bit(token, 512) for token in expected_tokens}
+    assert feature.bits == expected_bits
