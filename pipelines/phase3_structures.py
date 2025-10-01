@@ -153,7 +153,9 @@ def _expand_clusters_by_rxn(clusters_frame: Any) -> Any:
 _SUFFIX_CANDIDATES: tuple[str, ...] = ("", "_lvl2", "_sig")
 
 
-def _resolve_with_suffixes(row: dict[str, object], *names: str) -> object | None:
+def _resolve_with_suffixes(
+    row: dict[str, object], *names: str, suffixes: Sequence[str] | None = None
+) -> object | None:
     """Return the first non-empty value among candidate column names.
 
     Phase 3 joins tables that frequently introduce suffixes (``_lvl2``/``_sig``).
@@ -161,12 +163,18 @@ def _resolve_with_suffixes(row: dict[str, object], *names: str) -> object | None
     can remain agnostic to the exact origin of the column.
     """
 
+    suffix_order: Sequence[str]
+    if suffixes is None:
+        suffix_order = _SUFFIX_CANDIDATES
+    else:
+        suffix_order = tuple(suffixes)
+
     seen: set[str] = set()
     for name in names:
         for variant in {name, name.lower()}:
             if not variant:
                 continue
-            for suffix in _SUFFIX_CANDIDATES:
+            for suffix in suffix_order:
                 if suffix and variant.endswith(suffix):
                     key = variant
                 elif suffix:
@@ -208,7 +216,11 @@ def _build_structure_feature(row: dict[str, object], fp_bits: int = 128) -> Stru
     mech_sig_base = row.get("mech_sig_base")
     if mech_sig_base:
         tokens.add(f"mech:{mech_sig_base}")
-    event_source = _resolve_with_suffixes(row, "event_tokens")
+    event_source = _resolve_with_suffixes(
+        row,
+        "event_tokens",
+        suffixes=("", "_sig", "_lvl2"),
+    )
     for token in _loads_list(event_source):
         tokens.add(f"event:{token}")
 
