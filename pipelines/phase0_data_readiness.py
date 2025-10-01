@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+import statistics
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
@@ -72,6 +74,99 @@ def _present_mask(row: dict[str, Any]) -> int:
         if row.get(field) not in (None, "", []):
             mask |= 1 << idx
     return mask
+
+
+def _to_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+        return [text]
+    return [str(value)]
+
+
+def _log_counter(name: str, counter: Counter[Any], limit: int = 5) -> None:
+    if not counter:
+        LOGGER.info("%s: no observations", name)
+        return
+    top = counter.most_common(limit)
+    LOGGER.info("%s (top %s): %s", name, min(limit, len(counter)), top)
+
+
+def _summarize_normalization(
+    normalized: list[dict[str, Any]], deduped: list[dict[str, Any]]
+) -> None:
+    if not normalized:
+        LOGGER.warning("No normalized reactions produced; skipping statistics")
+        return
+
+    present_mask_counter = Counter(record.get("present_mask", 0) for record in normalized)
+    _log_counter("Present mask distribution (pre-dedup)", present_mask_counter)
+
+    reactant_lengths = [len(record.get("reactants_canonical") or []) for record in normalized]
+    product_lengths = [len(record.get("products_canonical") or []) for record in normalized]
+    agent_lengths = [len(record.get("agents_canonical") or []) for record in normalized]
+
+    if reactant_lengths:
+        LOGGER.info(
+            "Reactant counts: mean=%.2f median=%.2f min=%d max=%d",
+            statistics.fmean(reactant_lengths),
+            statistics.median(reactant_lengths),
+            min(reactant_lengths),
+            max(reactant_lengths),
+        )
+    if product_lengths:
+        LOGGER.info(
+            "Product counts: mean=%.2f median=%.2f min=%d max=%d",
+            statistics.fmean(product_lengths),
+            statistics.median(product_lengths),
+            min(product_lengths),
+            max(product_lengths),
+        )
+    if agent_lengths:
+        LOGGER.info(
+            "Agent counts: mean=%.2f median=%.2f min=%d max=%d",
+            statistics.fmean(agent_lengths),
+            statistics.median(agent_lengths),
+            min(agent_lengths),
+            max(agent_lengths),
+        )
+
+    hash_counter = Counter(record.get("reaction_hash_v1") for record in normalized)
+    duplicate_entries = sum(count - 1 for count in hash_counter.values() if count > 1)
+    if duplicate_entries:
+        LOGGER.info(
+            "Duplicate reaction hashes before deduplication: %d (%.2f%%)",
+            duplicate_entries,
+            100.0 * duplicate_entries / len(normalized),
+        )
+
+    solvent_counter = Counter(
+        solvent
+        for record in deduped
+        for solvent in _to_list(record.get("solvent_normalized"))
+    )
+    if solvent_counter:
+        LOGGER.info("Unique normalized solvents: %d", len(solvent_counter))
+        _log_counter("Most common solvents", solvent_counter)
+
+    present_mask_dedup = Counter(record.get("present_mask", 0) for record in deduped)
+    _log_counter("Present mask distribution (post-dedup)", present_mask_dedup)
+
+    substrate_counter = Counter(
+        record.get("role_main_substrate") or "unknown" for record in deduped
+    )
+    _log_counter("Main substrate assignments", substrate_counter)
 
 
 def _normalize_row(row: dict[str, Any]) -> NormalizationResult:
@@ -263,6 +358,8 @@ def main(
 
     deduped = _deduplicate(normalized_records)
     LOGGER.info("Deduped %s reactions into %s unique hashes", len(normalized_records), len(deduped))
+
+    _summarize_normalization(normalized_records, deduped)
 
     _write_output(deduped, Path(output_path))
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+import statistics
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -166,6 +168,80 @@ def _write_parquet(records: list[dict[str, Any]], path: Path) -> None:
     frame.to_parquet(path, index=False)
 
 
+def _log_counter(name: str, counter: Counter[Any], limit: int = 5) -> None:
+    if not counter:
+        LOGGER.info("%s: no observations", name)
+        return
+    top = counter.most_common(limit)
+    LOGGER.info("%s (top %s): %s", name, min(limit, len(counter)), top)
+
+
+def _summarize_mechanism_outputs(
+    signatures: list[MechanismSignature], clusters: list[MechanismCluster]
+) -> None:
+    if not signatures:
+        LOGGER.warning("No mechanism signatures produced; skipping statistics")
+        return
+
+    type_counter = Counter(signature.signature_type for signature in signatures)
+    _log_counter("Signature type distribution", type_counter)
+
+    cond_counter = Counter(signature.cond_hash for signature in signatures)
+    LOGGER.info("Mechanism condition buckets: %d", len(cond_counter))
+
+    base_counter = Counter(
+        signature.mech_sig_base for signature in signatures if signature.mech_sig_base
+    )
+    _log_counter("Mechanism base signature usage", base_counter)
+
+    event_lengths = [len(signature.event_tokens) for signature in signatures]
+    if event_lengths:
+        LOGGER.info(
+            "Event token counts: mean=%.2f median=%.2f min=%d max=%d",
+            statistics.fmean(event_lengths),
+            statistics.median(event_lengths),
+            min(event_lengths),
+            max(event_lengths),
+        )
+
+    event_counter = Counter(
+        token for signature in signatures for token in signature.event_tokens
+    )
+    if event_counter:
+        _log_counter("Most common event tokens", event_counter)
+    else:
+        LOGGER.warning("No event tokens present in signatures")
+
+    scaffold_counter = Counter(
+        signature.scaffold_key for signature in signatures if signature.scaffold_key
+    )
+    _log_counter("Scaffold usage", scaffold_counter)
+
+    redox_with_events = sum(1 for signature in signatures if signature.redox_events)
+    stereo_with_events = sum(1 for signature in signatures if signature.stereo_events)
+    ring_with_events = sum(1 for signature in signatures if signature.ring_events)
+    LOGGER.info(
+        "Reactions with redox/stereo/ring events: %d/%d/%d",
+        redox_with_events,
+        stereo_with_events,
+        ring_with_events,
+    )
+
+    if clusters:
+        cluster_sizes = [len(cluster.rxn_vids) for cluster in clusters]
+        LOGGER.info(
+            "Level 2 cluster sizes: mean=%.2f median=%.2f min=%d max=%d",
+            statistics.fmean(cluster_sizes),
+            statistics.median(cluster_sizes),
+            min(cluster_sizes),
+            max(cluster_sizes),
+        )
+        cluster_counter = Counter(cluster.cond_hash for cluster in clusters)
+        _log_counter("Clusters per condition bucket", cluster_counter)
+    else:
+        LOGGER.warning("No level 2 clusters were formed")
+
+
 @click.command()
 @click.option("--input", "input_path", required=True, type=click.Path(exists=True, dir_okay=False))
 @click.option("--cond-table", "cond_path", required=True, type=click.Path(exists=True, dir_okay=False))
@@ -200,6 +276,8 @@ def main(
 
     signatures = [_compute_signature_payload(row) for row in merged.to_dict(orient="records")]
     clusters = _cluster_signatures(signatures)
+
+    _summarize_mechanism_outputs(signatures, clusters)
 
     output_dir_path = Path(output_dir)
     mechanisms_path = output_dir_path / "mechanism_sigs.parquet"

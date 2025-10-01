@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+import statistics
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -154,6 +156,65 @@ def _cond_hash_components(
     return blake3_hexdigest(serialized.encode("utf-8"))
 
 
+def _log_counter(name: str, counter: Counter[Any], limit: int = 5) -> None:
+    if not counter:
+        LOGGER.info("%s: no observations", name)
+        return
+    top = counter.most_common(limit)
+    LOGGER.info("%s (top %s): %s", name, min(limit, len(counter)), top)
+
+
+def _summarize_condition_records(records: list[ConditionRecord]) -> None:
+    if not records:
+        LOGGER.warning("No condition records produced; skipping statistics")
+        return
+
+    cond_counter = Counter(record.cond_hash for record in records)
+    LOGGER.info("Unique condition hashes: %d", len(cond_counter))
+    _log_counter("Most common condition hashes", cond_counter)
+
+    prefix_counter = Counter(record.cond_hash_prefix for record in records)
+    _log_counter("cond_hash_prefix distribution", prefix_counter)
+
+    present_counter = Counter(record.present_mask for record in records)
+    _log_counter("Present mask distribution", present_counter)
+
+    temp_bins = Counter(record.temp_K_bin for record in records if record.temp_K_bin)
+    _log_counter("Temperature bin usage", temp_bins)
+
+    time_bins = Counter(record.time_s_bin for record in records if record.time_s_bin)
+    _log_counter("Time bin usage", time_bins)
+
+    pressure_bins = Counter(
+        record.pressure_Pa_bin for record in records if record.pressure_Pa_bin
+    )
+    _log_counter("Pressure bin usage", pressure_bins)
+
+    ph_bins = Counter(record.pH_bin for record in records if record.pH_bin)
+    _log_counter("pH bin usage", ph_bins)
+
+    solvent_keys = Counter(record.solvent_key for record in records if record.solvent_key)
+    _log_counter("Solvent key distribution", solvent_keys)
+
+    catalyst_keys = Counter(record.catalyst_key for record in records if record.catalyst_key)
+    _log_counter("Catalyst key distribution", catalyst_keys)
+
+    agent_keys = Counter(record.agent_key for record in records if record.agent_key)
+    _log_counter("Spectator/agent key distribution", agent_keys)
+
+    confidences = [
+        record.resolution_confidence
+        for record in records
+        if record.resolution_confidence is not None
+    ]
+    if confidences:
+        LOGGER.info(
+            "Solvent resolution confidence: mean=%.2f median=%.2f",
+            statistics.fmean(confidences),
+            statistics.median(confidences),
+        )
+
+
 @dataclass
 class ConditionRecord:
     rxn_vid: int
@@ -274,6 +335,8 @@ def main(input_path: str, output_path: str, sample: bool, verbose: bool) -> None
         LOGGER.info("Processing %d records", len(rows))
 
     records = [_build_condition_record(row) for row in rows]
+
+    _summarize_condition_records(records)
 
     output_path_obj = Path(output_path)
     LOGGER.info("Writing %d condition keys to %s", len(records), output_path_obj)
