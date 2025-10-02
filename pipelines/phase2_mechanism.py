@@ -399,6 +399,16 @@ def _summarize_mechanism_outputs(
         coarse_usage = Counter(
             signature.coarse_key for signature in signatures if signature.coarse_key
         )
+        family_usage: Counter[str] = Counter(
+            signature.coarse_key[0]
+            for signature in signatures
+            if signature.coarse_key and signature.coarse_key[0]
+        )
+        family_cluster_sizes: dict[str, list[int]] = defaultdict(list)
+        for cluster in clusters:
+            family = cluster.coarse_key[0]
+            if family:
+                family_cluster_sizes[family].append(len(cluster.rxn_vids))
         coarse_conditions: dict[
             tuple[str, tuple[tuple[str, str], ...]], set[str]
         ] = defaultdict(set)
@@ -420,6 +430,32 @@ def _summarize_mechanism_outputs(
                     }
                 )
             LOGGER.info("Top coarse signatures: %s", top_coarse)
+
+            if family_usage:
+                top_families = family_usage.most_common(5)
+                LOGGER.info(
+                    "Scaffold family distribution: unique=%d top=%s",
+                    len(family_usage),
+                    top_families,
+                )
+
+            if family_cluster_sizes:
+                top_family_sizes = []
+                for family, sizes in family_cluster_sizes.items():
+                    avg_size = statistics.fmean(sizes)
+                    top_family_sizes.append(
+                        {
+                            "family": family,
+                            "avg_cluster_size": round(avg_size, 2),
+                            "clusters": len(sizes),
+                        }
+                    )
+                top_family_sizes.sort(key=lambda item: item["avg_cluster_size"], reverse=True)
+                LOGGER.info(
+                    "Scaffold family average cluster sizes: unique=%d top=%s",
+                    len(family_cluster_sizes),
+                    top_family_sizes[:5],
+                )
 
             single_condition = [
                 {

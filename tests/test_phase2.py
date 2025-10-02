@@ -265,13 +265,25 @@ def test_summarize_mechanism_outputs_logs_percentiles(caplog):
         for msg in messages
         if msg.startswith("Coarse signatures limited to one condition bucket:")
     )
+    family_distribution_summary = next(
+        msg for msg in messages if msg.startswith("Scaffold family distribution:")
+    )
+    family_cluster_size_summary = next(
+        msg for msg in messages if msg.startswith("Scaffold family average cluster sizes:")
+    )
 
     _, top_payload = top_coarse_summary.split(": ", 1)
     top_entries = ast.literal_eval(top_payload)
     _, single_payload = single_condition_summary.split(": ", 1)
     single_entries = ast.literal_eval(single_payload)
+    _, family_payload = family_distribution_summary.split("top=", 1)
+    family_entries = ast.literal_eval(family_payload)
+    _, avg_payload = family_cluster_size_summary.split("top=", 1)
+    avg_entries = ast.literal_eval(avg_payload)
 
     assert "pct10=" in size_summary and "pct90=" in size_summary
     assert "pct25=" in base_summary and "pct75=" in base_summary
     assert any(entry["condition_buckets"] == 2 for entry in top_entries)
     assert any(entry["reactions"] == 1 for entry in single_entries)
+    assert any(entry[0] == "scaf_family" and entry[1] == 4 for entry in family_entries)
+    assert any(item["family"] == "scaf_family" for item in avg_entries)
