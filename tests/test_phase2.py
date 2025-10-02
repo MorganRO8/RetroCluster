@@ -1,10 +1,14 @@
 import json
+import logging
+from collections import Counter
 
 from pipelines.phase2_mechanism import (
     MechanismSignature,
+    MechanismCluster,
     _cluster_signatures,
     _coarse_mechanism_key,
     _compute_signature_payload,
+    _summarize_mechanism_outputs,
 )
 
 
@@ -178,3 +182,54 @@ def test_coarse_key_buckets_similar_event_tokens():
     assert len(clusters) == 1
     cluster = clusters[0]
     assert json.loads(cluster.to_dict()["rxn_vids"]) == [30, 31]
+
+
+def test_summarize_mechanism_outputs_logs_percentiles(caplog):
+    caplog.set_level(logging.INFO)
+
+    signatures = [
+        MechanismSignature(
+            rxn_vid=idx,
+            cond_hash="cond_a" if idx < 3 else "cond_b",
+            mech_sig_base=f"base_{idx % 2}",
+            mech_sig_r1=None,
+            mech_sig_r2=None,
+            signature_type="mapped",
+            event_tokens=["token"],
+            redox_events=0,
+            stereo_events=0,
+            ring_events=0,
+            scaffold_key="scaf",
+        )
+        for idx in range(1, 5)
+    ]
+    for signature in signatures:
+        signature.coarse_key = ("scaf_family", (("family", "one"),))
+
+    clusters = [
+        MechanismCluster(
+            cond_hash="cond_a",
+            cluster_id="c1",
+            coarse_key=("scaf_family", (("family", "one"),)),
+            mech_sig_base_counts=Counter({"base_1": 2, "base_0": 1}),
+            rxn_vids=[1, 2, 3],
+        ),
+        MechanismCluster(
+            cond_hash="cond_b",
+            cluster_id="c2",
+            coarse_key=("scaf_family", (("family", "one"),)),
+            mech_sig_base_counts=Counter({"base_0": 1}),
+            rxn_vids=[4],
+        ),
+    ]
+
+    _summarize_mechanism_outputs(signatures, clusters)
+
+    messages = [record.getMessage() for record in caplog.records]
+    size_summary = next(msg for msg in messages if msg.startswith("Level 2 cluster sizes:"))
+    base_summary = next(
+        msg for msg in messages if msg.startswith("Distinct mech_sig_base per cluster:")
+    )
+
+    assert "pct10=" in size_summary and "pct90=" in size_summary
+    assert "pct25=" in base_summary and "pct75=" in base_summary

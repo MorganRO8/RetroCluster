@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import statistics
 from collections import Counter
 from dataclasses import dataclass
@@ -198,6 +199,40 @@ def _format_coarse_key(coarse_key: tuple[str, tuple[tuple[str, str], ...]]) -> s
     return f"{scaffold_part}|{family_part}"
 
 
+def _compute_percentiles(values: list[float], percentiles: Iterable[int]) -> dict[int, float]:
+    if not values:
+        return {}
+    sorted_values = sorted(values)
+    count = len(sorted_values)
+    results: dict[int, float] = {}
+    for percentile in percentiles:
+        if percentile < 0 or percentile > 100:
+            continue
+        if count == 1:
+            results[percentile] = float(sorted_values[0])
+            continue
+        rank = (percentile / 100) * (count - 1)
+        lower = math.floor(rank)
+        upper = math.ceil(rank)
+        lower_value = sorted_values[lower]
+        upper_value = sorted_values[upper]
+        if lower == upper:
+            value = float(lower_value)
+        else:
+            weight = rank - lower
+            value = float(lower_value) + (float(upper_value) - float(lower_value)) * weight
+        results[percentile] = value
+    return results
+
+
+def _format_percentiles(percentiles: dict[int, float]) -> str:
+    if not percentiles:
+        return ""
+    ordered = sorted(percentiles.items())
+    formatted = " ".join(f"pct{percentile}={value:.2f}" for percentile, value in ordered)
+    return formatted
+
+
 def _compute_signature_payload(row: dict[str, Any]) -> MechanismSignature:
     rxn_vid = int(row["rxn_vid"])
     cond_hash = str(row["cond_hash"])
@@ -338,12 +373,25 @@ def _summarize_mechanism_outputs(
 
     if clusters:
         cluster_sizes = [len(cluster.rxn_vids) for cluster in clusters]
+        size_percentiles = _compute_percentiles([float(size) for size in cluster_sizes], [10, 25, 50, 75, 90])
         LOGGER.info(
-            "Level 2 cluster sizes: mean=%.2f median=%.2f min=%d max=%d",
+            "Level 2 cluster sizes: mean=%.2f median=%.2f min=%d max=%d %s",
             statistics.fmean(cluster_sizes),
             statistics.median(cluster_sizes),
             min(cluster_sizes),
             max(cluster_sizes),
+            _format_percentiles(size_percentiles),
+        )
+
+        base_diversity = [len(cluster.mech_sig_base_counts) for cluster in clusters]
+        base_percentiles = _compute_percentiles([float(count) for count in base_diversity], [10, 25, 50, 75, 90])
+        LOGGER.info(
+            "Distinct mech_sig_base per cluster: mean=%.2f median=%.2f min=%d max=%d %s",
+            statistics.fmean(base_diversity),
+            statistics.median(base_diversity),
+            min(base_diversity),
+            max(base_diversity),
+            _format_percentiles(base_percentiles),
         )
         cluster_counter = Counter(cluster.cond_hash for cluster in clusters)
         _log_counter("Clusters per condition bucket", cluster_counter)
