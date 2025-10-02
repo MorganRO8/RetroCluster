@@ -1,10 +1,15 @@
+import ast
 import json
+import logging
+from collections import Counter
 
 from pipelines.phase2_mechanism import (
     MechanismSignature,
+    MechanismCluster,
     _cluster_signatures,
     _coarse_mechanism_key,
     _compute_signature_payload,
+    _summarize_mechanism_outputs,
 )
 
 
@@ -178,3 +183,107 @@ def test_coarse_key_buckets_similar_event_tokens():
     assert len(clusters) == 1
     cluster = clusters[0]
     assert json.loads(cluster.to_dict()["rxn_vids"]) == [30, 31]
+
+
+def test_summarize_mechanism_outputs_logs_percentiles(caplog):
+    caplog.set_level(logging.INFO)
+
+    main_coarse_key = ("scaf_family", (("family", "one"),))
+    single_coarse_key = ("other_family", (("other", "one"),))
+
+    signatures = [
+        MechanismSignature(
+            rxn_vid=idx,
+            cond_hash="cond_a" if idx in {1, 2} else "cond_b",
+            mech_sig_base=f"base_{idx % 2}",
+            mech_sig_r1=None,
+            mech_sig_r2=None,
+            signature_type="mapped",
+            event_tokens=["token"],
+            redox_events=0,
+            stereo_events=0,
+            ring_events=0,
+            scaffold_key="scaf",
+        )
+        for idx in range(1, 5)
+    ]
+
+    extra_signature = MechanismSignature(
+        rxn_vid=5,
+        cond_hash="cond_c",
+        mech_sig_base="base_extra",
+        mech_sig_r1=None,
+        mech_sig_r2=None,
+        signature_type="mapped",
+        event_tokens=["extra"],
+        redox_events=0,
+        stereo_events=0,
+        ring_events=0,
+        scaffold_key="other_scaf",
+    )
+
+    signatures.append(extra_signature)
+
+    for signature in signatures[:4]:
+        signature.coarse_key = main_coarse_key
+    signatures[4].coarse_key = single_coarse_key
+
+    clusters = [
+        MechanismCluster(
+            cond_hash="cond_a",
+            cluster_id="c1",
+            coarse_key=main_coarse_key,
+            mech_sig_base_counts=Counter({"base_1": 1, "base_0": 1}),
+            rxn_vids=[1, 2],
+        ),
+        MechanismCluster(
+            cond_hash="cond_b",
+            cluster_id="c2",
+            coarse_key=main_coarse_key,
+            mech_sig_base_counts=Counter({"base_1": 1, "base_0": 1}),
+            rxn_vids=[3, 4],
+        ),
+        MechanismCluster(
+            cond_hash="cond_c",
+            cluster_id="c3",
+            coarse_key=single_coarse_key,
+            mech_sig_base_counts=Counter({"base_extra": 1}),
+            rxn_vids=[5],
+        ),
+    ]
+
+    _summarize_mechanism_outputs(signatures, clusters)
+
+    messages = [record.getMessage() for record in caplog.records]
+    size_summary = next(msg for msg in messages if msg.startswith("Level 2 cluster sizes:"))
+    base_summary = next(
+        msg for msg in messages if msg.startswith("Distinct mech_sig_base per cluster:")
+    )
+    top_coarse_summary = next(msg for msg in messages if msg.startswith("Top coarse signatures:"))
+    single_condition_summary = next(
+        msg
+        for msg in messages
+        if msg.startswith("Coarse signatures limited to one condition bucket:")
+    )
+    family_distribution_summary = next(
+        msg for msg in messages if msg.startswith("Scaffold family distribution:")
+    )
+    family_cluster_size_summary = next(
+        msg for msg in messages if msg.startswith("Scaffold family average cluster sizes:")
+    )
+
+    _, top_payload = top_coarse_summary.split(": ", 1)
+    top_entries = ast.literal_eval(top_payload)
+    _, single_payload = single_condition_summary.split(": ", 1)
+    single_entries = ast.literal_eval(single_payload)
+    _, family_payload = family_distribution_summary.split("top=", 1)
+    family_entries = ast.literal_eval(family_payload)
+    _, avg_payload = family_cluster_size_summary.split("top=", 1)
+    avg_entries = ast.literal_eval(avg_payload)
+
+    assert "pct10=" in size_summary and "pct90=" in size_summary
+    assert "pct25=" in base_summary and "pct75=" in base_summary
+    assert any(entry["condition_buckets"] == 2 for entry in top_entries)
+    assert any(entry["reactions"] == 1 for entry in single_entries)
+    assert any(entry[0] == "scaf_family" and entry[1] == 4 for entry in family_entries)
+    assert any(item["family"] == "scaf_family" for item in avg_entries)

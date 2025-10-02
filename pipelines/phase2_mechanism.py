@@ -4,8 +4,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import statistics
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -198,6 +199,40 @@ def _format_coarse_key(coarse_key: tuple[str, tuple[tuple[str, str], ...]]) -> s
     return f"{scaffold_part}|{family_part}"
 
 
+def _compute_percentiles(values: list[float], percentiles: Iterable[int]) -> dict[int, float]:
+    if not values:
+        return {}
+    sorted_values = sorted(values)
+    count = len(sorted_values)
+    results: dict[int, float] = {}
+    for percentile in percentiles:
+        if percentile < 0 or percentile > 100:
+            continue
+        if count == 1:
+            results[percentile] = float(sorted_values[0])
+            continue
+        rank = (percentile / 100) * (count - 1)
+        lower = math.floor(rank)
+        upper = math.ceil(rank)
+        lower_value = sorted_values[lower]
+        upper_value = sorted_values[upper]
+        if lower == upper:
+            value = float(lower_value)
+        else:
+            weight = rank - lower
+            value = float(lower_value) + (float(upper_value) - float(lower_value)) * weight
+        results[percentile] = value
+    return results
+
+
+def _format_percentiles(percentiles: dict[int, float]) -> str:
+    if not percentiles:
+        return ""
+    ordered = sorted(percentiles.items())
+    formatted = " ".join(f"pct{percentile}={value:.2f}" for percentile, value in ordered)
+    return formatted
+
+
 def _compute_signature_payload(row: dict[str, Any]) -> MechanismSignature:
     rxn_vid = int(row["rxn_vid"])
     cond_hash = str(row["cond_hash"])
@@ -338,12 +373,25 @@ def _summarize_mechanism_outputs(
 
     if clusters:
         cluster_sizes = [len(cluster.rxn_vids) for cluster in clusters]
+        size_percentiles = _compute_percentiles([float(size) for size in cluster_sizes], [10, 25, 50, 75, 90])
         LOGGER.info(
-            "Level 2 cluster sizes: mean=%.2f median=%.2f min=%d max=%d",
+            "Level 2 cluster sizes: mean=%.2f median=%.2f min=%d max=%d %s",
             statistics.fmean(cluster_sizes),
             statistics.median(cluster_sizes),
             min(cluster_sizes),
             max(cluster_sizes),
+            _format_percentiles(size_percentiles),
+        )
+
+        base_diversity = [len(cluster.mech_sig_base_counts) for cluster in clusters]
+        base_percentiles = _compute_percentiles([float(count) for count in base_diversity], [10, 25, 50, 75, 90])
+        LOGGER.info(
+            "Distinct mech_sig_base per cluster: mean=%.2f median=%.2f min=%d max=%d %s",
+            statistics.fmean(base_diversity),
+            statistics.median(base_diversity),
+            min(base_diversity),
+            max(base_diversity),
+            _format_percentiles(base_percentiles),
         )
         cluster_counter = Counter(cluster.cond_hash for cluster in clusters)
         _log_counter("Clusters per condition bucket", cluster_counter)
@@ -351,13 +399,78 @@ def _summarize_mechanism_outputs(
         coarse_usage = Counter(
             signature.coarse_key for signature in signatures if signature.coarse_key
         )
+        family_usage: Counter[str] = Counter(
+            signature.coarse_key[0]
+            for signature in signatures
+            if signature.coarse_key and signature.coarse_key[0]
+        )
+        family_cluster_sizes: dict[str, list[int]] = defaultdict(list)
+        for cluster in clusters:
+            family = cluster.coarse_key[0]
+            if family:
+                family_cluster_sizes[family].append(len(cluster.rxn_vids))
+        coarse_conditions: dict[
+            tuple[str, tuple[tuple[str, str], ...]], set[str]
+        ] = defaultdict(set)
+        for signature in signatures:
+            if not signature.coarse_key:
+                continue
+            coarse_conditions[signature.coarse_key].add(signature.cond_hash)
         LOGGER.info("Unique coarse mechanism signatures: %d", len(coarse_usage))
         if coarse_usage:
-            top_coarse = [
-                (count, _format_coarse_key(coarse_key))
-                for coarse_key, count in coarse_usage.most_common(5)
+            top_coarse = []
+            for coarse_key, count in coarse_usage.most_common(5):
+                formatted_key = _format_coarse_key(coarse_key)
+                cond_count = len(coarse_conditions.get(coarse_key, set()))
+                top_coarse.append(
+                    {
+                        "key": formatted_key,
+                        "reactions": count,
+                        "condition_buckets": cond_count,
+                    }
+                )
+            LOGGER.info("Top coarse signatures: %s", top_coarse)
+
+            if family_usage:
+                top_families = family_usage.most_common(5)
+                LOGGER.info(
+                    "Scaffold family distribution: unique=%d top=%s",
+                    len(family_usage),
+                    top_families,
+                )
+
+            if family_cluster_sizes:
+                top_family_sizes = []
+                for family, sizes in family_cluster_sizes.items():
+                    avg_size = statistics.fmean(sizes)
+                    top_family_sizes.append(
+                        {
+                            "family": family,
+                            "avg_cluster_size": round(avg_size, 2),
+                            "clusters": len(sizes),
+                        }
+                    )
+                top_family_sizes.sort(key=lambda item: item["avg_cluster_size"], reverse=True)
+                LOGGER.info(
+                    "Scaffold family average cluster sizes: unique=%d top=%s",
+                    len(family_cluster_sizes),
+                    top_family_sizes[:5],
+                )
+
+            single_condition = [
+                {
+                    "key": _format_coarse_key(coarse_key),
+                    "reactions": coarse_usage[coarse_key],
+                }
+                for coarse_key, conds in coarse_conditions.items()
+                if len(conds) == 1
             ]
-            LOGGER.info("Top coarse signatures (count, key): %s", top_coarse)
+            if single_condition:
+                single_condition.sort(key=lambda item: item["reactions"], reverse=True)
+                LOGGER.info(
+                    "Coarse signatures limited to one condition bucket: %s",
+                    single_condition[:5],
+                )
 
         top_clusters = [
             (len(cluster.rxn_vids), _format_coarse_key(cluster.coarse_key))
