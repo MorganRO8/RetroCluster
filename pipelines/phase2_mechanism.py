@@ -6,7 +6,7 @@ import json
 import logging
 import math
 import statistics
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -399,13 +399,42 @@ def _summarize_mechanism_outputs(
         coarse_usage = Counter(
             signature.coarse_key for signature in signatures if signature.coarse_key
         )
+        coarse_conditions: dict[
+            tuple[str, tuple[tuple[str, str], ...]], set[str]
+        ] = defaultdict(set)
+        for signature in signatures:
+            if not signature.coarse_key:
+                continue
+            coarse_conditions[signature.coarse_key].add(signature.cond_hash)
         LOGGER.info("Unique coarse mechanism signatures: %d", len(coarse_usage))
         if coarse_usage:
-            top_coarse = [
-                (count, _format_coarse_key(coarse_key))
-                for coarse_key, count in coarse_usage.most_common(5)
+            top_coarse = []
+            for coarse_key, count in coarse_usage.most_common(5):
+                formatted_key = _format_coarse_key(coarse_key)
+                cond_count = len(coarse_conditions.get(coarse_key, set()))
+                top_coarse.append(
+                    {
+                        "key": formatted_key,
+                        "reactions": count,
+                        "condition_buckets": cond_count,
+                    }
+                )
+            LOGGER.info("Top coarse signatures: %s", top_coarse)
+
+            single_condition = [
+                {
+                    "key": _format_coarse_key(coarse_key),
+                    "reactions": coarse_usage[coarse_key],
+                }
+                for coarse_key, conds in coarse_conditions.items()
+                if len(conds) == 1
             ]
-            LOGGER.info("Top coarse signatures (count, key): %s", top_coarse)
+            if single_condition:
+                single_condition.sort(key=lambda item: item["reactions"], reverse=True)
+                LOGGER.info(
+                    "Coarse signatures limited to one condition bucket: %s",
+                    single_condition[:5],
+                )
 
         top_clusters = [
             (len(cluster.rxn_vids), _format_coarse_key(cluster.coarse_key))

@@ -1,3 +1,4 @@
+import ast
 import json
 import logging
 from collections import Counter
@@ -187,10 +188,13 @@ def test_coarse_key_buckets_similar_event_tokens():
 def test_summarize_mechanism_outputs_logs_percentiles(caplog):
     caplog.set_level(logging.INFO)
 
+    main_coarse_key = ("scaf_family", (("family", "one"),))
+    single_coarse_key = ("other_family", (("other", "one"),))
+
     signatures = [
         MechanismSignature(
             rxn_vid=idx,
-            cond_hash="cond_a" if idx < 3 else "cond_b",
+            cond_hash="cond_a" if idx in {1, 2} else "cond_b",
             mech_sig_base=f"base_{idx % 2}",
             mech_sig_r1=None,
             mech_sig_r2=None,
@@ -203,23 +207,48 @@ def test_summarize_mechanism_outputs_logs_percentiles(caplog):
         )
         for idx in range(1, 5)
     ]
-    for signature in signatures:
-        signature.coarse_key = ("scaf_family", (("family", "one"),))
+
+    extra_signature = MechanismSignature(
+        rxn_vid=5,
+        cond_hash="cond_c",
+        mech_sig_base="base_extra",
+        mech_sig_r1=None,
+        mech_sig_r2=None,
+        signature_type="mapped",
+        event_tokens=["extra"],
+        redox_events=0,
+        stereo_events=0,
+        ring_events=0,
+        scaffold_key="other_scaf",
+    )
+
+    signatures.append(extra_signature)
+
+    for signature in signatures[:4]:
+        signature.coarse_key = main_coarse_key
+    signatures[4].coarse_key = single_coarse_key
 
     clusters = [
         MechanismCluster(
             cond_hash="cond_a",
             cluster_id="c1",
-            coarse_key=("scaf_family", (("family", "one"),)),
-            mech_sig_base_counts=Counter({"base_1": 2, "base_0": 1}),
-            rxn_vids=[1, 2, 3],
+            coarse_key=main_coarse_key,
+            mech_sig_base_counts=Counter({"base_1": 1, "base_0": 1}),
+            rxn_vids=[1, 2],
         ),
         MechanismCluster(
             cond_hash="cond_b",
             cluster_id="c2",
-            coarse_key=("scaf_family", (("family", "one"),)),
-            mech_sig_base_counts=Counter({"base_0": 1}),
-            rxn_vids=[4],
+            coarse_key=main_coarse_key,
+            mech_sig_base_counts=Counter({"base_1": 1, "base_0": 1}),
+            rxn_vids=[3, 4],
+        ),
+        MechanismCluster(
+            cond_hash="cond_c",
+            cluster_id="c3",
+            coarse_key=single_coarse_key,
+            mech_sig_base_counts=Counter({"base_extra": 1}),
+            rxn_vids=[5],
         ),
     ]
 
@@ -230,6 +259,19 @@ def test_summarize_mechanism_outputs_logs_percentiles(caplog):
     base_summary = next(
         msg for msg in messages if msg.startswith("Distinct mech_sig_base per cluster:")
     )
+    top_coarse_summary = next(msg for msg in messages if msg.startswith("Top coarse signatures:"))
+    single_condition_summary = next(
+        msg
+        for msg in messages
+        if msg.startswith("Coarse signatures limited to one condition bucket:")
+    )
+
+    _, top_payload = top_coarse_summary.split(": ", 1)
+    top_entries = ast.literal_eval(top_payload)
+    _, single_payload = single_condition_summary.split(": ", 1)
+    single_entries = ast.literal_eval(single_payload)
 
     assert "pct10=" in size_summary and "pct90=" in size_summary
     assert "pct25=" in base_summary and "pct75=" in base_summary
+    assert any(entry["condition_buckets"] == 2 for entry in top_entries)
+    assert any(entry["reactions"] == 1 for entry in single_entries)
