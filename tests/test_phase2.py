@@ -98,3 +98,83 @@ def test_cluster_coalesces_by_coarse_key():
     assert sig_a.cluster_id == cluster.cluster_id == sig_b.cluster_id
     base_counts = json.loads(cluster.to_dict()["mech_sig_base_counts"])
     assert base_counts == {"base_a": 1, "base_b": 1}
+
+
+def test_coarse_key_uses_scaffold_family():
+    sig_a = MechanismSignature(
+        rxn_vid=20,
+        cond_hash="cond",
+        mech_sig_base="base",
+        mech_sig_r1=None,
+        mech_sig_r2=None,
+        signature_type="mapped",
+        event_tokens=["+C:1", "-1:1"],
+        redox_events=0,
+        stereo_events=0,
+        ring_events=0,
+        scaffold_key="c1ccccc1",
+    )
+    sig_b = MechanismSignature(
+        rxn_vid=21,
+        cond_hash="cond",
+        mech_sig_base="base",
+        mech_sig_r1=None,
+        mech_sig_r2=None,
+        signature_type="mapped",
+        event_tokens=["+N:1", "-2:1"],
+        redox_events=0,
+        stereo_events=0,
+        ring_events=0,
+        scaffold_key="c1ccc(cc1)C",
+    )
+
+    key_a = _coarse_mechanism_key(sig_a)
+    key_b = _coarse_mechanism_key(sig_b)
+
+    assert key_a == key_b
+    assert key_a[0] == "aromatic"
+
+    clusters = _cluster_signatures([sig_a, sig_b])
+    assert len(clusters) == 1
+    cluster = clusters[0]
+    assert json.loads(cluster.to_dict()["rxn_vids"]) == [20, 21]
+
+
+def test_coarse_key_buckets_similar_event_tokens():
+    sig_a = MechanismSignature(
+        rxn_vid=30,
+        cond_hash="cond",
+        mech_sig_base="base",
+        mech_sig_r1=None,
+        mech_sig_r2=None,
+        signature_type="mapped",
+        event_tokens=["+C:1", "-1:1"],
+        redox_events=0,
+        stereo_events=0,
+        ring_events=0,
+        scaffold_key="CCO",
+    )
+    sig_b = MechanismSignature(
+        rxn_vid=31,
+        cond_hash="cond",
+        mech_sig_base="base",
+        mech_sig_r1=None,
+        mech_sig_r2=None,
+        signature_type="mapped",
+        event_tokens=["+N:2", "-2:1"],
+        redox_events=0,
+        stereo_events=0,
+        ring_events=0,
+        scaffold_key="CCO",
+    )
+
+    key_a = _coarse_mechanism_key(sig_a)
+    key_b = _coarse_mechanism_key(sig_b)
+
+    assert key_a == key_b
+    assert key_a[1] == (("gain:atom_upper", "one"), ("loss:ring_index", "one"))
+
+    clusters = _cluster_signatures([sig_a, sig_b])
+    assert len(clusters) == 1
+    cluster = clusters[0]
+    assert json.loads(cluster.to_dict()["rxn_vids"]) == [30, 31]

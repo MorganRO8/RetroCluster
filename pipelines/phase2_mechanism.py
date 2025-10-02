@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover - allow CLI helpers to signal requirement
     pd = None  # type: ignore[assignment]
 
 from signatures import map_reaction, mech_sig_from_mapping, mech_sig_unmapped
-from structures import main_scaffold
+from structures import coarse_scaffold_family, main_scaffold
 
 LOGGER = logging.getLogger(__name__)
 
@@ -131,21 +131,64 @@ def _bucket_event_count(count: int) -> str:
     return "many"
 
 
+def _coarse_event_family(token: str) -> str:
+    """Bucket raw event tokens into broad categories for coarse grouping."""
+
+    if not token:
+        return "noop"
+
+    base, _, _ = token.partition(":")
+    base = base.strip()
+    if not base:
+        return "noop"
+
+    polarity = "neutral"
+    remainder = base
+
+    if base[0] in {"+", "-"}:
+        polarity = "gain" if base[0] == "+" else "loss"
+        remainder = base[1:]
+    elif base[0] in {"=", "#", "~"}:
+        polarity = "bond"
+        remainder = base[1:]
+
+    remainder = remainder.strip()
+
+    if not remainder:
+        kind = "other"
+    elif ":" in remainder or "," in remainder:
+        kind = "composite"
+    elif remainder.isdigit() or any(char.isdigit() for char in remainder):
+        kind = "ring_index"
+    elif remainder.isalpha():
+        if remainder.isupper():
+            kind = "atom_upper"
+        elif remainder.islower():
+            kind = "atom_lower"
+        else:
+            kind = "atom_mixed"
+    elif set(remainder) <= set("-=#"):
+        kind = "bond_symbol"
+    elif set(remainder) <= set("()[]{}"):  # topology / parentheses markers
+        kind = "topology"
+    else:
+        kind = "other"
+
+    return f"{polarity}:{kind}"
+
+
 def _coarse_mechanism_key(signature: MechanismSignature) -> tuple[str, tuple[tuple[str, str], ...]]:
     families: list[str] = []
     for token in signature.event_tokens:
-        if not token:
-            continue
-        family, _, _ = token.partition(":")
-        family = family.strip()
+        family = _coarse_event_family(token)
         if family:
             families.append(family)
     if not families:
         families = ["noop"]
     counts = Counter(families)
     bucketed = tuple(sorted((family, _bucket_event_count(count)) for family, count in counts.items()))
-    scaffold = signature.scaffold_key or ""
-    return (scaffold, bucketed)
+    scaffold_family = coarse_scaffold_family(signature.scaffold_key)
+    return (scaffold_family, bucketed)
 
 
 def _format_coarse_key(coarse_key: tuple[str, tuple[tuple[str, str], ...]]) -> str:
