@@ -1,6 +1,7 @@
 """Phase 2 – mechanism / transformation clustering."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import statistics
@@ -17,7 +18,7 @@ except Exception:  # pragma: no cover - allow CLI helpers to signal requirement
     pd = None  # type: ignore[assignment]
 
 from signatures import map_reaction, mech_sig_from_mapping, mech_sig_unmapped
-from structures import main_scaffold
+from structures import coarse_scaffold_family, main_scaffold
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,11 +36,18 @@ class MechanismSignature:
     stereo_events: int
     ring_events: int
     scaffold_key: str
+    coarse_key: tuple[str, tuple[tuple[str, str], ...]] | None = None
     cluster_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = self.__dict__.copy()
         payload["event_tokens"] = json.dumps(self.event_tokens, sort_keys=True)
+        if self.coarse_key is None:
+            payload["coarse_key"] = None
+            payload["coarse_key_hash"] = None
+        else:
+            payload["coarse_key"] = json.dumps(_serialize_coarse_key(self.coarse_key), sort_keys=True)
+            payload["coarse_key_hash"] = _hash_coarse_key(self.coarse_key)
         return payload
 
 
@@ -47,14 +55,21 @@ class MechanismSignature:
 class MechanismCluster:
     cond_hash: str
     cluster_id: str
-    mech_sig_base: str
+    coarse_key: tuple[str, tuple[tuple[str, str], ...]]
+    mech_sig_base_counts: Counter[str]
     rxn_vids: list[int]
 
     def to_dict(self) -> dict[str, Any]:
+        representative_base = ""
+        if self.mech_sig_base_counts:
+            representative_base = self.mech_sig_base_counts.most_common(1)[0][0]
         return {
             "cond_hash": self.cond_hash,
             "cluster_id": self.cluster_id,
-            "mech_sig_base": self.mech_sig_base,
+            "mech_sig_base": representative_base,
+            "mech_sig_base_counts": json.dumps(dict(self.mech_sig_base_counts), sort_keys=True),
+            "coarse_key": json.dumps(_serialize_coarse_key(self.coarse_key), sort_keys=True),
+            "coarse_key_hash": _hash_coarse_key(self.coarse_key),
             "rxn_count": len(self.rxn_vids),
             "rxn_vids": json.dumps(sorted(self.rxn_vids)),
         }
@@ -98,6 +113,91 @@ def _reaction_smiles(reactants: list[str], products: list[str]) -> str:
     return f"{lhs}>>{rhs}"
 
 
+def _serialize_coarse_key(coarse_key: tuple[str, tuple[tuple[str, str], ...]]) -> dict[str, Any]:
+    scaffold, families = coarse_key
+    return {"scaffold": scaffold, "families": list(families)}
+
+
+def _hash_coarse_key(coarse_key: tuple[str, tuple[tuple[str, str], ...]]) -> str:
+    serialized = json.dumps(_serialize_coarse_key(coarse_key), sort_keys=True)
+    return hashlib.blake2s(serialized.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def _bucket_event_count(count: int) -> str:
+    if count <= 1:
+        return "one"
+    if count <= 4:
+        return "few"
+    return "many"
+
+
+def _coarse_event_family(token: str) -> str:
+    """Bucket raw event tokens into broad categories for coarse grouping."""
+
+    if not token:
+        return "noop"
+
+    base, _, _ = token.partition(":")
+    base = base.strip()
+    if not base:
+        return "noop"
+
+    polarity = "neutral"
+    remainder = base
+
+    if base[0] in {"+", "-"}:
+        polarity = "gain" if base[0] == "+" else "loss"
+        remainder = base[1:]
+    elif base[0] in {"=", "#", "~"}:
+        polarity = "bond"
+        remainder = base[1:]
+
+    remainder = remainder.strip()
+
+    if not remainder:
+        kind = "other"
+    elif ":" in remainder or "," in remainder:
+        kind = "composite"
+    elif remainder.isdigit() or any(char.isdigit() for char in remainder):
+        kind = "ring_index"
+    elif remainder.isalpha():
+        if remainder.isupper():
+            kind = "atom_upper"
+        elif remainder.islower():
+            kind = "atom_lower"
+        else:
+            kind = "atom_mixed"
+    elif set(remainder) <= set("-=#"):
+        kind = "bond_symbol"
+    elif set(remainder) <= set("()[]{}"):  # topology / parentheses markers
+        kind = "topology"
+    else:
+        kind = "other"
+
+    return f"{polarity}:{kind}"
+
+
+def _coarse_mechanism_key(signature: MechanismSignature) -> tuple[str, tuple[tuple[str, str], ...]]:
+    families: list[str] = []
+    for token in signature.event_tokens:
+        family = _coarse_event_family(token)
+        if family:
+            families.append(family)
+    if not families:
+        families = ["noop"]
+    counts = Counter(families)
+    bucketed = tuple(sorted((family, _bucket_event_count(count)) for family, count in counts.items()))
+    scaffold_family = coarse_scaffold_family(signature.scaffold_key)
+    return (scaffold_family, bucketed)
+
+
+def _format_coarse_key(coarse_key: tuple[str, tuple[tuple[str, str], ...]]) -> str:
+    scaffold, families = coarse_key
+    family_part = ",".join(f"{family}:{bucket}" for family, bucket in families) if families else "noop"
+    scaffold_part = scaffold or "no_scaffold"
+    return f"{scaffold_part}|{family_part}"
+
+
 def _compute_signature_payload(row: dict[str, Any]) -> MechanismSignature:
     rxn_vid = int(row["rxn_vid"])
     cond_hash = str(row["cond_hash"])
@@ -123,7 +223,7 @@ def _compute_signature_payload(row: dict[str, Any]) -> MechanismSignature:
 
     scaffold_key = main_scaffold(reactants, products, role_info)
 
-    return MechanismSignature(
+    signature = MechanismSignature(
         rxn_vid=rxn_vid,
         cond_hash=cond_hash,
         mech_sig_base=str(signature_payload.get("mech_sig_base")),
@@ -136,25 +236,34 @@ def _compute_signature_payload(row: dict[str, Any]) -> MechanismSignature:
         ring_events=int(signature_payload.get("ring_events", 0)),
         scaffold_key=scaffold_key,
     )
+    signature.coarse_key = _coarse_mechanism_key(signature)
+    return signature
 
 
 def _cluster_signatures(signatures: Iterable[MechanismSignature]) -> list[MechanismCluster]:
     clusters: list[MechanismCluster] = []
-    by_cond: dict[str, dict[str, list[MechanismSignature]]] = {}
+    by_cond: dict[str, dict[tuple[str, tuple[tuple[str, str], ...]], list[MechanismSignature]]] = {}
     for signature in signatures:
         cond_group = by_cond.setdefault(signature.cond_hash, {})
-        cond_group.setdefault(signature.mech_sig_base, []).append(signature)
+        coarse_key = signature.coarse_key or _coarse_mechanism_key(signature)
+        signature.coarse_key = coarse_key
+        cond_group.setdefault(coarse_key, []).append(signature)
 
-    for cond_hash, base_groups in sorted(by_cond.items()):
-        for idx, (mech_sig_base, members) in enumerate(sorted(base_groups.items()), start=1):
+    for cond_hash, coarse_groups in sorted(by_cond.items()):
+        sorted_groups = sorted(coarse_groups.items(), key=lambda item: _format_coarse_key(item[0]))
+        for idx, (coarse_key, members) in enumerate(sorted_groups, start=1):
             cluster_id = f"{cond_hash}-{idx}"
             for member in members:
                 member.cluster_id = cluster_id
+            base_counts = Counter(
+                member.mech_sig_base for member in members if member.mech_sig_base
+            )
             clusters.append(
                 MechanismCluster(
                     cond_hash=cond_hash,
                     cluster_id=cluster_id,
-                    mech_sig_base=mech_sig_base,
+                    coarse_key=coarse_key,
+                    mech_sig_base_counts=base_counts,
                     rxn_vids=[member.rxn_vid for member in members],
                 )
             )
@@ -238,6 +347,23 @@ def _summarize_mechanism_outputs(
         )
         cluster_counter = Counter(cluster.cond_hash for cluster in clusters)
         _log_counter("Clusters per condition bucket", cluster_counter)
+
+        coarse_usage = Counter(
+            signature.coarse_key for signature in signatures if signature.coarse_key
+        )
+        LOGGER.info("Unique coarse mechanism signatures: %d", len(coarse_usage))
+        if coarse_usage:
+            top_coarse = [
+                (count, _format_coarse_key(coarse_key))
+                for coarse_key, count in coarse_usage.most_common(5)
+            ]
+            LOGGER.info("Top coarse signatures (count, key): %s", top_coarse)
+
+        top_clusters = [
+            (len(cluster.rxn_vids), _format_coarse_key(cluster.coarse_key))
+            for cluster in sorted(clusters, key=lambda c: len(c.rxn_vids), reverse=True)[:5]
+        ]
+        LOGGER.info("Top coarse clusters by size: %s", top_clusters)
     else:
         LOGGER.warning("No level 2 clusters were formed")
 
