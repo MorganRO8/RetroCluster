@@ -219,7 +219,11 @@ def _structure_components(
 
     tokens: set[str] = {f"scaffold:{scaffold_key}"}
 
-    mech_sig_val = row.get("mech_sig_base")
+    mech_sig_val = _resolve_with_suffixes(
+        row,
+        "mech_sig_base",
+        suffixes=("_sig", "_lvl2", ""),
+    )
     mech_sig_base: str | None
     if mech_sig_val is None:
         mech_sig_base = None
